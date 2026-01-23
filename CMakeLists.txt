@@ -39,9 +39,10 @@ juce_generate_juce_header(BasicInstrument)
 
 # --- Embed assets (fuente) ---
 # Asegúrate de tener: assets/mi_fuente.ttf
+# Recomendado: ruta absoluta para Windows/CI
 juce_add_binary_data(BasicInstrumentAssets
   SOURCES
-    assets/mi_fuente.ttf
+    "${CMAKE_CURRENT_LIST_DIR}/assets/mi_fuente.ttf"
 )
 
 target_sources(BasicInstrument
@@ -61,3 +62,13 @@ target_link_libraries(BasicInstrument
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
 )
+
+# ------------------------------------------------------------------------------
+# FIX: evitar el #error de JUCE por conflicto VST2/VST3 parameter automation
+# (aunque compiles solo VST3, esto fuerza la configuración correcta)
+target_compile_definitions(BasicInstrument PRIVATE
+  JucePlugin_Build_VST=0
+  JucePlugin_Build_VST3=1
+  JUCE_VST3_CAN_REPLACE_VST2=0
+)
+
