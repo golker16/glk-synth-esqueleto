@@ -241,6 +241,20 @@ namespace ui
                                                                BinaryData::mi_fuente_ttfSize);
         }
 
+        // Helper para forzar el uso de la fuente embebida incluso en texto dibujado "a mano"
+        // (por ejemplo, el valor dentro del knob), donde un juce::Font creado directamente
+        // puede saltarse el override de getTypefaceForFont.
+        juce::Font font (float height, int styleFlags = juce::Font::plain) const
+        {
+            juce::Font f;
+            if (typeface != nullptr)
+                f = juce::Font (typeface);
+
+            f.setHeight (height);
+            f.setStyleFlags (styleFlags);
+            return f;
+        }
+
         juce::Typeface::Ptr getTypefaceForFont (const juce::Font& /*font*/) override
         {
             // “Todo lo escrito” usa esta fuente
@@ -255,7 +269,8 @@ namespace ui
                                float rotaryStartAngle, float rotaryEndAngle,
                                juce::Slider& slider) override
         {
-            auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) w, (float) h).reduced (6.0f);
+            // Un poco menos de padding para que el knob se sienta más "preciso" y compacto.
+            auto bounds = juce::Rectangle<float> ((float) x, (float) y, (float) w, (float) h).reduced (4.0f);
             auto r = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
             auto cx = bounds.getCentreX();
             auto cy = bounds.getCentreY();
@@ -292,13 +307,18 @@ namespace ui
             g.setColour (juce::Colours::white.withAlpha (0.9f));
             g.drawLine ({ p1, p2 }, juce::jmax (2.0f, lineW * 0.45f));
 
-            // Texto valor (opcional, peque)
+            // Texto valor (más cerca del indicador: dentro del knob, en la mitad inferior)
             if (slider.isEnabled())
             {
                 g.setColour (juce::Colours::white.withAlpha (0.80f));
                 auto valueText = slider.getTextFromValue (slider.getValue());
-                g.setFont (juce::Font (12.0f));
-                g.drawFittedText (valueText, bounds.toNearestInt().reduced (10), juce::Justification::centredBottom, 1);
+
+                auto valueArea = bounds.toNearestInt();
+                valueArea = valueArea.withTrimmedTop (valueArea.getHeight() / 2 - 4)
+                                     .reduced (10, 6);
+
+                g.setFont (font (12.0f));
+                g.drawFittedText (valueText, valueArea, juce::Justification::centred, 1);
             }
         }
 
@@ -312,10 +332,19 @@ namespace ui
                        const juce::String& labelText)
         : attachment (apvts, paramId, slider)
         {
-            slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+            // Movilidad: el modo "velocity" suele sentirse raro en knobs.
+            // Preferimos drag vertical (más predecible) + sensibilidad controlada.
+            slider.setSliderStyle (juce::Slider::RotaryVerticalDrag);
             slider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
             slider.setPopupDisplayEnabled (true, true, this);
-            slider.setVelocityBasedMode (true);
+            slider.setVelocityBasedMode (false);
+            slider.setMouseDragSensitivity (160);
+            slider.setScrollWheelEnabled (true);
+
+            // Arco típico de knob (de ~7:30 a ~4:30). StopAtEnd = true evita “saltos”.
+            slider.setRotaryParameters (juce::MathConstants<float>::pi * 1.25f,
+                                       juce::MathConstants<float>::pi * 2.75f,
+                                       true);
 
             label.setText (labelText, juce::dontSendNotification);
             label.setJustificationType (juce::Justification::centred);
@@ -328,8 +357,8 @@ namespace ui
         void resized() override
         {
             auto r = getLocalBounds();
-            label.setBounds (r.removeFromBottom (20));
-            slider.setBounds (r);
+            label.setBounds (r.removeFromBottom (18));
+            slider.setBounds (r.reduced (2));
         }
 
         juce::Slider slider;
@@ -353,9 +382,19 @@ public:
     {
         setLookAndFeel (&lnf);
 
+        // Asegurar tipografía en TODO el texto (títulos/labels)
+        title.setFont (lnf.font (18.0f, juce::Font::bold));
+
         title.setText ("BASIC INSTRUMENT", juce::dontSendNotification);
         title.setJustificationType (juce::Justification::centred);
         addAndMakeVisible (title);
+
+        auto labelFont = lnf.font (12.0f, juce::Font::bold);
+        knobGain.label.setFont    (labelFont);
+        knobAttack.label.setFont  (labelFont);
+        knobDecay.label.setFont   (labelFont);
+        knobSustain.label.setFont (labelFont);
+        knobRelease.label.setFont (labelFont);
 
         addAndMakeVisible (knobGain);
         addAndMakeVisible (knobAttack);
@@ -363,7 +402,8 @@ public:
         addAndMakeVisible (knobSustain);
         addAndMakeVisible (knobRelease);
 
-        setSize (520, 240);
+        // Tamaño ajustado (los knobs antes quedaban "2x" grandes)
+        setSize (400, 200);
     }
 
     ~BasicInstrumentAudioProcessorEditor() override
@@ -393,14 +433,14 @@ public:
         r.removeFromTop (6);
 
         auto knobsArea = r;
-        const int knobW = 96;
-        const int knobH = 150;
+        const int knobW = 64;
+        const int knobH = 112;
 
         // layout simple en fila
         auto row = knobsArea.removeFromTop (knobH);
         auto place = [&](juce::Component& c)
         {
-            c.setBounds (row.removeFromLeft (knobW).reduced (6, 0));
+            c.setBounds (row.removeFromLeft (knobW).reduced (3, 0));
         };
 
         place (knobGain);
