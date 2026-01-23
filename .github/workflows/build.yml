@@ -1,4 +1,4 @@
-name: build-windows
+name: build-vst3-windows
 
 on:
   push:
@@ -7,54 +7,89 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
 
     steps:
-      - name: Checkout (submodules + LFS)
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
           lfs: true
+          submodules: recursive
+          fetch-depth: 0
 
-      - name: Verify assets (font)
+      - name: Show assets directory (if present)
         shell: pwsh
         run: |
-          Write-Host "Workspace:" $env:GITHUB_WORKSPACE
-          Write-Host "Listing assets folder (if exists)..."
-          if (!(Test-Path "assets")) {
-            throw "Missing folder: assets/ (commit it to the repo)"
+          Write-Host "Contenido de assets (si existe):"
+          if (Test-Path ".\assets") {
+            Get-ChildItem -Path ".\assets" -Force | Format-Table -AutoSize
+          } else {
+            Write-Host "No existe carpeta assets/ en el repo (OK si no la usas)."
           }
 
-          Get-ChildItem -Recurse "assets" | Format-Table FullName, Length
-
-          if (!(Test-Path "assets/mi_fuente.ttf")) {
-            throw "Missing file: assets/mi_fuente.ttf (not committed, ignored, or LFS not pulled)"
+          if (Test-Path ".\assets\mi_fuente.ttf") {
+            $f = Get-Item ".\assets\mi_fuente.ttf"
+            Write-Host "Encontrada fuente: $($f.FullName)  Size: $($f.Length) bytes"
+            if ($f.Length -lt 1024) {
+              Write-Host "AVISO: el archivo es muy pequeño (<1KB). Si usas Git LFS, revisa que se esté bajando bien."
+            }
+          } else {
+            Write-Host "AVISO: no se encontró assets/mi_fuente.ttf (si tu plugin la requiere, esto romperá BinaryData)."
+            # Si quieres que falle duro cuando falte la fuente, descomenta:
+            # throw "Missing assets/mi_fuente.ttf"
           }
 
-          $f = Get-Item "assets/mi_fuente.ttf"
-          if ($f.Length -lt 1024) {
-            Write-Host "Font file is suspiciously small (<1KB). If you use Git LFS, ensure lfs: true is enabled."
-          }
-          Write-Host "Font OK:" $f.FullName "Size:" $f.Length "bytes"
-
-      - name: Configure (CMake)
+      - name: Configure (CMake, VS2022 x64 Release)
         shell: pwsh
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: >
+          cmake -S . -B build
+          -G "Visual Studio 17 2022"
+          -A x64
 
       - name: Build (Release)
         shell: pwsh
-        run: |
-          cmake --build build --config Release --parallel --verbose
+        run: cmake --build build --config Release --parallel
 
-      - name: Upload VST3 artifact
+      - name: Locate VST3 bundle + verify moduleinfo.json + package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          # Encuentra carpetas *.vst3 generadas
+          $vst3Dirs = Get-ChildItem -Path build -Recurse -Directory -Filter "*.vst3"
+
+          if (-not $vst3Dirs -or $vst3Dirs.Count -eq 0) {
+            Write-Error "No se encontró ningún bundle .vst3 dentro de build/. Revisa la ruta de artefacts."
+            exit 1
+          }
+
+          foreach ($p in $vst3Dirs) {
+            $dest = Join-Path "dist" $p.Name
+            if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+
+            Copy-Item -Recurse -Force $p.FullName $dest
+
+            # moduleinfo.json debe vivir en: <Plugin>.vst3/Contents/Resources/moduleinfo.json
+            $mi = Join-Path $dest "Contents/Resources/moduleinfo.json"
+            if (-not (Test-Path $mi)) {
+              Write-Error "Falta moduleinfo.json en: $mi  (FL Studio 2025 puede no verificar/detectar el plugin sin esto)"
+              exit 1
+            }
+
+            Write-Host "OK: bundle copiado -> $dest"
+            Write-Host "OK: moduleinfo.json -> $mi"
+          }
+
+          # Zip del/los bundles .vst3
+          $zipPath = "dist/PluginSaturador1-vst3-windows.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+
+          Compress-Archive -Path "dist/*.vst3" -DestinationPath $zipPath
+          Write-Host "ZIP creado: $zipPath"
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BasicInstrument-Windows-VST3
-          if-no-files-found: error
-          path: |
-            build/**/BasicInstrument*.vst3*
-            build/**/Release/**/BasicInstrument*.vst3*
-            build/**/VST3/**/BasicInstrument*.vst3*
-            build/**/*_artefacts/**/VST3/**/BasicInstrument*.vst3*
-
+          name: PluginSaturador1-vst3-windows
+          path: dist/PluginSaturador1-vst3-windows.zip
