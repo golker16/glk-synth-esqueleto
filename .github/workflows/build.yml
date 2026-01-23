@@ -1,4 +1,4 @@
-name: build
+name: build-windows
 
 on:
   push:
@@ -6,42 +6,55 @@ on:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: windows-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout (submodules + LFS)
         uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
+          submodules: recursive
+          lfs: true
 
-      - name: Install deps (Linux)
-        if: runner.os == 'Linux'
+      - name: Verify assets (font)
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev libx11-dev libxext-dev libxinerama-dev libxrandr-dev \
-            libxcursor-dev libfreetype6-dev libfontconfig1-dev
+          Write-Host "Workspace:" $env:GITHUB_WORKSPACE
+          Write-Host "Listing assets folder (if exists)..."
+          if (!(Test-Path "assets")) {
+            throw "Missing folder: assets/ (commit it to the repo)"
+          }
 
-      - name: Configure
-        shell: bash
+          Get-ChildItem -Recurse "assets" | Format-Table FullName, Length
+
+          if (!(Test-Path "assets/mi_fuente.ttf")) {
+            throw "Missing file: assets/mi_fuente.ttf (not committed, ignored, or LFS not pulled)"
+          }
+
+          $f = Get-Item "assets/mi_fuente.ttf"
+          if ($f.Length -lt 1024) {
+            Write-Host "Font file is suspiciously small (<1KB). If you use Git LFS, ensure lfs: true is enabled."
+          }
+          Write-Host "Font OK:" $f.FullName "Size:" $f.Length "bytes"
+
+      - name: Configure (CMake)
+        shell: pwsh
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
-      - name: Build
-        shell: bash
+      - name: Build (Release)
+        shell: pwsh
         run: |
-          cmake --build build --config Release --parallel
+          cmake --build build --config Release --parallel --verbose
 
       - name: Upload VST3 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BasicInstrument-${{ runner.os }}-VST3
+          name: BasicInstrument-Windows-VST3
+          if-no-files-found: error
           path: |
             build/**/BasicInstrument*.vst3*
             build/**/Release/**/BasicInstrument*.vst3*
             build/**/VST3/**/BasicInstrument*.vst3*
+            build/**/*_artefacts/**/VST3/**/BasicInstrument*.vst3*
+
