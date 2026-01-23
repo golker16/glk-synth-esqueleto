@@ -18,70 +18,78 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Show assets directory (if present)
+      # IMPORTANTÍSIMO: a veces submodules + lfs:true no baja LFS dentro de submodules.
+      - name: Ensure Git LFS files are pulled (repo + submodules)
         shell: pwsh
         run: |
-          Write-Host "Contenido de assets (si existe):"
-          if (Test-Path ".\assets") {
-            Get-ChildItem -Path ".\assets" -Force | Format-Table -AutoSize
-          } else {
-            Write-Host "No existe carpeta assets/ en el repo (OK si no la usas)."
+          git lfs install
+          git lfs pull
+          git submodule foreach --recursive "git lfs pull"
+
+      - name: Verify font file (exists + not LFS pointer)
+        shell: pwsh
+        run: |
+          if (!(Test-Path ".\assets")) { throw "Missing folder: assets/ (no está en el repo)" }
+          if (!(Test-Path ".\assets\mi_fuente.ttf")) { throw "Missing file: assets/mi_fuente.ttf (no está commiteado o no bajó LFS)" }
+
+          $f = Get-Item ".\assets\mi_fuente.ttf"
+          Write-Host "Font path: $($f.FullName)"
+          Write-Host "Font size: $($f.Length) bytes"
+
+          # Detecta si es un pointer de LFS (texto)
+          $head = (Get-Content ".\assets\mi_fuente.ttf" -TotalCount 3 -ErrorAction SilentlyContinue) -join "`n"
+          if ($head -match "git-lfs.github.com") {
+            throw "assets/mi_fuente.ttf es un POINTER de Git LFS (no se descargó el binario real)."
           }
 
-          if (Test-Path ".\assets\mi_fuente.ttf") {
-            $f = Get-Item ".\assets\mi_fuente.ttf"
-            Write-Host "Encontrada fuente: $($f.FullName)  Size: $($f.Length) bytes"
-            if ($f.Length -lt 1024) {
-              Write-Host "AVISO: el archivo es muy pequeño (<1KB). Si usas Git LFS, revisa que se esté bajando bien."
-            }
-          } else {
-            Write-Host "AVISO: no se encontró assets/mi_fuente.ttf (si tu plugin la requiere, esto romperá BinaryData)."
-            # Si quieres que falle duro cuando falte la fuente, descomenta:
-            # throw "Missing assets/mi_fuente.ttf"
-          }
-
-      - name: Configure (CMake, VS2022 x64 Release)
+      - name: Configure (CMake, VS2022 x64)
         shell: pwsh
         run: >
           cmake -S . -B build
           -G "Visual Studio 17 2022"
           -A x64
 
-      - name: Build (Release)
+      # Esto te imprime el comando exacto que MSBuild está corriendo para BinaryData
+      - name: Show BinaryData build rule (debug)
         shell: pwsh
-        run: cmake --build build --config Release --parallel
+        run: |
+          $rule = Get-ChildItem -Path build -Recurse -Filter "BinaryData1.cpp.rule" | Select-Object -First 1
+          if ($rule) {
+            Write-Host "Found rule file:" $rule.FullName
+            Get-Content $rule.FullName | Select-Object -First 200
+          } else {
+            Write-Host "No BinaryData1.cpp.rule found (aún no generado)."
+          }
+
+      - name: Build (Release, verbose)
+        shell: pwsh
+        run: cmake --build build --config Release --parallel --verbose
 
       - name: Locate VST3 bundle + verify moduleinfo.json + package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
-          # Encuentra carpetas *.vst3 generadas
           $vst3Dirs = Get-ChildItem -Path build -Recurse -Directory -Filter "*.vst3"
-
           if (-not $vst3Dirs -or $vst3Dirs.Count -eq 0) {
-            Write-Error "No se encontró ningún bundle .vst3 dentro de build/. Revisa la ruta de artefacts."
+            Write-Error "No se encontró ningún bundle .vst3 dentro de build/."
             exit 1
           }
 
           foreach ($p in $vst3Dirs) {
             $dest = Join-Path "dist" $p.Name
             if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
-
             Copy-Item -Recurse -Force $p.FullName $dest
 
-            # moduleinfo.json debe vivir en: <Plugin>.vst3/Contents/Resources/moduleinfo.json
             $mi = Join-Path $dest "Contents/Resources/moduleinfo.json"
             if (-not (Test-Path $mi)) {
-              Write-Error "Falta moduleinfo.json en: $mi  (FL Studio 2025 puede no verificar/detectar el plugin sin esto)"
+              Write-Error "Falta moduleinfo.json en: $mi"
               exit 1
             }
-
             Write-Host "OK: bundle copiado -> $dest"
             Write-Host "OK: moduleinfo.json -> $mi"
           }
 
-          # Zip del/los bundles .vst3
           $zipPath = "dist/PluginSaturador1-vst3-windows.zip"
           if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
 
@@ -93,3 +101,4 @@ jobs:
         with:
           name: PluginSaturador1-vst3-windows
           path: dist/PluginSaturador1-vst3-windows.zip
+
