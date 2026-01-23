@@ -19,7 +19,7 @@ juce_add_plugin(BasicInstrument
   COMPANY_NAME "YourCompany"
   PRODUCT_NAME "BasicInstrument"
 
-  # IDs únicos (cámbialos para tu plugin)
+  # IDs únicos (cámbialos)
   PLUGIN_MANUFACTURER_CODE Yc01
   PLUGIN_CODE BsI1
 
@@ -37,6 +37,13 @@ juce_add_plugin(BasicInstrument
 
 juce_generate_juce_header(BasicInstrument)
 
+# --- Embed assets (fuente) ---
+# Asegúrate de tener: assets/mi_fuente.ttf
+juce_add_binary_data(BasicInstrumentAssets
+  SOURCES
+    assets/mi_fuente.ttf
+)
+
 target_sources(BasicInstrument
   PRIVATE
     src/PluginProcessor.cpp
@@ -48,6 +55,7 @@ target_link_libraries(BasicInstrument
     juce::juce_audio_processors
     juce::juce_audio_utils
     juce::juce_dsp
+    BasicInstrumentAssets
   PUBLIC
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
