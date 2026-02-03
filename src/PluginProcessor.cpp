@@ -1,9 +1,23 @@
+/*
+  ==============================================================================
+
+    PluginProcessor.cpp
+    - Fixes includes for CI/MSVC
+    - Adds BinaryData include for embedded font
+    - JUCE 6 compatibility: avoids juce::FontOptions when not available
+
+  ==============================================================================
+*/
+
 #include "PluginProcessor.h"
 
 #include <cmath>
 #include <vector>
 #include <cstring>
 #include <memory>
+#include <array>
+#include <atomic>          // <-- NECESARIO por std::atomic
+#include "BinaryData.h"    // <-- NECESARIO por BinaryData::mi_fuente_ttf
 
 //==============================================================================
 // Synth Sound (dummy)
@@ -96,7 +110,7 @@ namespace
 
     // ------------------------------
     // Minimum-phase reconstruction from magnitude spectrum (real signal)
-    // Implements the standard real-cepstrum method (same concept as the Python reference).
+    // Implements the standard real-cepstrum method.
     static bool minimumPhaseFromMagRfft (const std::vector<float>& magRfft, int N, std::vector<float>& outTime)
     {
         if (N <= 0)
@@ -814,6 +828,16 @@ void BasicInstrumentAudioProcessor::setStateInformation (const void* data, int s
 // UI: LookAndFeel + fuente global + knobs básicos
 namespace ui
 {
+    // JUCE 6/7 compat: FontOptions existe en JUCE 7+
+    static inline juce::Font makeFontHeight (float height)
+    {
+       #if defined (JUCE_MAJOR_VERSION) && (JUCE_MAJOR_VERSION >= 7)
+        return juce::Font (juce::FontOptions (height));
+       #else
+        return juce::Font (height);
+       #endif
+    }
+
     struct BasicLNF : public juce::LookAndFeel_V4
     {
         BasicLNF()
@@ -830,7 +854,8 @@ namespace ui
 
         juce::Font font (float height, int styleFlags = juce::Font::plain) const
         {
-            juce::Font f (juce::FontOptions (height));
+            juce::Font f = makeFontHeight (height);
+
             if (typeface != nullptr)
                 f = juce::Font (typeface).withHeight (height);
 
@@ -843,7 +868,7 @@ namespace ui
             if (typeface != nullptr)
                 return typeface;
 
-            return juce::LookAndFeel_V4::getTypefaceForFont (juce::Font (juce::FontOptions (12.0f)));
+            return juce::LookAndFeel_V4::getTypefaceForFont (makeFontHeight (12.0f));
         }
 
         void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h,
@@ -1121,5 +1146,4 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new BasicInstrumentAudioProcessor();
 }
-
 
