@@ -1,6 +1,6 @@
 #pragma once
-#include <JuceHeader.h>
 
+#include <JuceHeader.h>
 #include <array>
 
 class BasicInstrumentAudioProcessor : public juce::AudioProcessor
@@ -11,14 +11,24 @@ public:
     struct Wavetable : public juce::ReferenceCountedObject
     {
         using Ptr = juce::ReferenceCountedObjectPtr<Wavetable>;
+
         int tableSize = 0;
         int frames = 0;
         juce::AudioBuffer<float> table; // [frames][tableSize]
         juce::String name;
     };
 
+    // Carga un WTGen / wavetable en un slot (0..3). Devuelve false y llena 'err' si falla.
     bool loadWtgenSlot (int slot, const juce::File& file, juce::String& err);
+
+    // Obtiene el wavetable del slot (0..3) o nullptr si está vacío/índice inválido.
     Wavetable::Ptr getWtSlot (int slot) const;
+
+    //==============================================================================
+    // Métodos que tu PluginProcessor.cpp ya está llamando (según tus errores)
+    std::array<Wavetable::Ptr, 4> getWtSlotsSnapshot() const;
+    juce::String getWtSlotName (int index) const;
+    juce::String getWtSlotJson (int index) const;
 
     //==============================================================================
     BasicInstrumentAudioProcessor();
@@ -54,11 +64,13 @@ public:
 
 private:
     //==============================================================================
-    // Wavetable slots storage
+    // Wavetable slots storage (estos miembros son los que te faltaban)
     mutable juce::SpinLock wtLock;
     std::array<Wavetable::Ptr, 4> wtSlots {};
+    std::array<juce::String, 4> wtSlotName {};
     std::array<juce::String, 4> wtSlotJson {};
 
+    //==============================================================================
     juce::Synthesiser synth;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BasicInstrumentAudioProcessor)
