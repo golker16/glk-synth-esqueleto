@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <complex>
 
 //==============================================================================
 // WTGEN loader + DSP helpers (single-file, sin archivos extra)
@@ -80,6 +79,12 @@ namespace wtgen
         return true;
     }
 
+    static inline juce::dsp::Complex<float> conjC (juce::dsp::Complex<float> c)
+    {
+        c.imag = -c.imag;
+        return c;
+    }
+
     // Minimum-phase reconstruction from magnitude via cepstrum.
     static bool minimumPhaseFromMagnitude (const std::vector<float>& magHalf, std::vector<float>& outTime)
     {
@@ -90,62 +95,69 @@ namespace wtgen
         const int order = (int) std::round (std::log2 ((double) N));
         juce::dsp::FFT fft (order);
 
-        using C = std::complex<float>;
+        using C = juce::dsp::Complex<float>;
+
         std::vector<C> spec ((size_t) N);
         std::vector<C> tmp  ((size_t) N);
 
         constexpr float eps = 1.0e-12f;
 
-        // build log|X| with Hermitian symmetry
+        // build log|X| with Hermitian symmetry (imag=0)
         for (int k = 0; k <= N / 2; ++k)
         {
             const float m = juce::jmax (magHalf[(size_t) k], eps);
-            spec[(size_t) k] = C (std::log (m), 0.0f);
+            spec[(size_t) k].real = std::log (m);
+            spec[(size_t) k].imag = 0.0f;
         }
         for (int k = N / 2 + 1; k < N; ++k)
-            spec[(size_t) k] = std::conj (spec[(size_t) (N - k)]);
+            spec[(size_t) k] = conjC (spec[(size_t) (N - k)]);
 
         // IFFT -> real cepstrum (stored in tmp)
-        fft.perform ((juce::dsp::Complex<float>*) spec.data(),
-                     (juce::dsp::Complex<float>*) tmp.data(),
-                     true);
+        fft.perform (spec.data(), tmp.data(), true);
         for (int n = 0; n < N; ++n)
-            tmp[(size_t) n] /= (float) N;
+        {
+            tmp[(size_t) n].real /= (float) N;
+            tmp[(size_t) n].imag /= (float) N;
+        }
 
         // causal cepstrum
         for (int n = 1; n < N; ++n)
         {
-            if (n < N / 2) tmp[(size_t) n] *= 2.0f;
-            else if (n > N / 2) tmp[(size_t) n] = C (0.0f, 0.0f);
+            if (n < N / 2)
+            {
+                tmp[(size_t) n].real *= 2.0f;
+                tmp[(size_t) n].imag *= 2.0f;
+            }
+            else if (n > N / 2)
+            {
+                tmp[(size_t) n].real = 0.0f;
+                tmp[(size_t) n].imag = 0.0f;
+            }
         }
 
         // FFT -> min-phase log spectrum
-        fft.perform ((juce::dsp::Complex<float>*) tmp.data(),
-                     (juce::dsp::Complex<float>*) spec.data(),
-                     false);
+        fft.perform (tmp.data(), spec.data(), false);
 
         // exp(log spectrum)
         for (int k = 0; k < N; ++k)
         {
-            const float a = spec[(size_t) k].real();
-            const float b = spec[(size_t) k].imag();
+            const float a = spec[(size_t) k].real;
+            const float b = spec[(size_t) k].imag;
             const float ea = std::exp (a);
-            spec[(size_t) k] = C (ea * std::cos (b), ea * std::sin (b));
+            spec[(size_t) k].real = ea * std::cos (b);
+            spec[(size_t) k].imag = ea * std::sin (b);
         }
 
         // enforce Hermitian
-        spec[0] = C (spec[0].real(), 0.0f);
-        spec[(size_t) (N / 2)] = C (spec[(size_t) (N / 2)].real(), 0.0f);
+        spec[0].imag = 0.0f;
+        spec[(size_t) (N / 2)].imag = 0.0f;
         for (int k = N / 2 + 1; k < N; ++k)
-            spec[(size_t) k] = std::conj (spec[(size_t) (N - k)]);
+            spec[(size_t) k] = conjC (spec[(size_t) (N - k)]);
 
         // IFFT -> time
-        fft.perform ((juce::dsp::Complex<float>*) spec.data(),
-                     (juce::dsp::Complex<float>*) tmp.data(),
-                     true);
-
+        fft.perform (spec.data(), tmp.data(), true);
         for (int n = 0; n < N; ++n)
-            outTime[(size_t) n] = tmp[(size_t) n].real() / (float) N;
+            outTime[(size_t) n] = tmp[(size_t) n].real / (float) N;
 
         return true;
     }
@@ -341,11 +353,12 @@ namespace wtgen
     {
         err.clear();
 
-        juce::Result jsonRes = juce::Result::ok();
-        juce::var root = juce::JSON::parse (jsonText, jsonRes);
-        if (jsonRes.failed())
+        // JUCE de tu proyecto: JSON::parse devuelve Result y llena un var&
+        juce::var root;
+        juce::Result res = juce::JSON::parse (jsonText, root);
+        if (res.failed())
         {
-            err = "JSON invalido: " + jsonRes.getErrorMessage();
+            err = "JSON invalido: " + res.getErrorMessage();
             return false;
         }
 
@@ -412,7 +425,7 @@ namespace wtgen
         getInt (pObj, "frames", fp.frames);
 
         // harmonics object
-        if (auto hv = pObj->getProperty ("harmonics"); hv.isObject())
+        if (auto hv = pObj->getProperty ("harmonics"); hv.getDynamicObject() != nullptr)
         {
             auto* hObj = hv.getDynamicObject();
             int hc = 0;
@@ -424,7 +437,7 @@ namespace wtgen
         }
 
         // noise object
-        if (auto nv = pObj->getProperty ("noise"); nv.isObject())
+        if (auto nv = pObj->getProperty ("noise"); nv.getDynamicObject() != nullptr)
         {
             auto* nObj = nv.getDynamicObject();
             int bands = 0;
@@ -433,9 +446,9 @@ namespace wtgen
             getInt (nObj, "bands", bands);
             getFloat (nObj, "dbRange", dbRange);
             getFloat (nObj, "quantDb", quantDb);
-            fp.noiseBands  = bands;
-            fp.noiseDbRange = dbRange;
-            fp.noiseQuantDb = quantDb;
+            fp.noiseBands    = bands;
+            fp.noiseDbRange  = dbRange;
+            fp.noiseQuantDb  = quantDb;
         }
 
         juce::String b64;
@@ -445,12 +458,14 @@ namespace wtgen
             return false;
         }
 
-        juce::MemoryBlock bin;
-        if (! juce::Base64::convertFromBase64 (bin, b64))
+        // TU JUCE: Base64::convertFromBase64 solo acepta OutputStream&
+        juce::MemoryOutputStream mo;
+        if (! juce::Base64::convertFromBase64 (mo, b64))
         {
             err = "JSON: base64 invalido.";
             return false;
         }
+        const auto& bin = mo.getMemoryBlock();
 
         juce::AudioBuffer<float> contiguous;
         if (! decodeFramepackToContiguous (bin.getData(), bin.getSize(), fp, contiguous, err))
@@ -472,27 +487,6 @@ namespace wtgen
         removeDCAndNormalize (wt->table);
 
         outWT = wt;
-        return true;
-    }
-
-    // Helper to load from JSON into a processor slot (no header changes needed)
-    static bool setSlotFromJson (BasicInstrumentAudioProcessor& proc,
-                                int slot,
-                                const juce::String& jsonText,
-                                const juce::String& name,
-                                juce::String& err)
-    {
-        BasicInstrumentAudioProcessor::Wavetable::Ptr wt;
-        if (! loadWtgenJsonToWavetable (jsonText, wt, err))
-            return false;
-
-        wt->name = name;
-
-        {
-            const juce::SpinLock::ScopedLockType lock (proc.wtLock);
-            proc.wtSlots[(size_t) slot] = wt;
-        }
-
         return true;
     }
 }
@@ -626,7 +620,7 @@ struct WavetableVoice : public juce::SynthesiserVoice
                 if (wt[k] != nullptr)
                     s = sampleWT (*wt[k], morph, phase[k]);
                 else
-                    s = 0.0f; // fallback (o seno si quieres)
+                    s = 0.0f;
 
                 mix += s * mixLevel[k];
 
@@ -778,9 +772,18 @@ bool BasicInstrumentAudioProcessor::loadWtgenSlot (int slot, const juce::File& f
         return false;
     }
 
-    // parse + decode + set slot
-    if (! wtgen::setSlotFromJson (*this, slot, jsonText, file.getFileName(), err))
+    // parse + decode -> Wavetable
+    BasicInstrumentAudioProcessor::Wavetable::Ptr wt;
+    if (! wtgen::loadWtgenJsonToWavetable (jsonText, wt, err))
         return false;
+
+    wt->name = file.getFileName();
+
+    // set slot under lock (private members OK here)
+    {
+        const juce::SpinLock::ScopedLockType lock (wtLock);
+        wtSlots[(size_t) slot] = wt;
+    }
 
     // Persist JSON + name in APVTS state so the host recalls it
     apvts.state.setProperty ("wt_slot" + juce::String (slot + 1) + "_json", jsonText, nullptr);
@@ -882,8 +885,14 @@ void BasicInstrumentAudioProcessor::setStateInformation (const void* data, int s
             name = nameVar.toString();
 
         juce::String err;
-        wtgen::setSlotFromJson (*this, slot, jsonText, name, err);
-        // Si falla, simplemente no restauramos ese slot (sin crash).
+        BasicInstrumentAudioProcessor::Wavetable::Ptr wt;
+        if (wtgen::loadWtgenJsonToWavetable (jsonText, wt, err))
+        {
+            wt->name = name;
+            const juce::SpinLock::ScopedLockType lock (wtLock);
+            wtSlots[(size_t) slot] = wt;
+        }
+        // si falla, ignoramos ese slot sin crashear
     }
 }
 
@@ -901,7 +910,6 @@ namespace ui
             setColour (juce::Label::textColourId,                juce::Colours::white.withAlpha (0.90f));
             setColour (juce::Label::outlineColourId,             juce::Colours::transparentBlack);
 
-            // Requiere que mi_fuente.ttf esté embebida en BinaryData (como en tu proyecto original)
             typeface = juce::Typeface::createSystemTypefaceFor (BinaryData::mi_fuente_ttf,
                                                                BinaryData::mi_fuente_ttfSize);
         }
@@ -1065,7 +1073,7 @@ public:
         for (int i = 0; i < 4; ++i)
         {
             loadWT[i].setButtonText ("LOAD WT" + juce::String (i + 1));
-            loadWT[i].onClick = [this, i] { loadSlot (i); };
+            loadWT[i].onClick = [this, i] { launchLoadDialog (i); };
             addAndMakeVisible (loadWT[i]);
 
             wtName[i].setFont (lnf.font (12.0f));
@@ -1080,6 +1088,7 @@ public:
 
     ~BasicInstrumentAudioProcessorEditor() override
     {
+        chooser.reset();
         setLookAndFeel (nullptr);
     }
 
@@ -1160,27 +1169,30 @@ private:
         }
     }
 
-    void loadSlot (int slot)
+    void launchLoadDialog (int slot)
     {
-        juce::FileChooser chooser ("Select .wtgen.json wavetable",
-                                  juce::File{},
-                                  "*.json;*.wtgen.json");
+        chooser.reset (new juce::FileChooser ("Select .wtgen.json wavetable",
+                                             juce::File{},
+                                             "*.json;*.wtgen.json"));
 
-        if (! chooser.browseForFileToOpen())
-            return;
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                              [this, slot] (const juce::FileChooser& fc)
+                              {
+                                  auto file = fc.getResult();
+                                  if (! file.existsAsFile())
+                                      return;
 
-        auto file = chooser.getResult();
+                                  juce::String err;
+                                  if (! proc.loadWtgenSlot (slot, file, err))
+                                  {
+                                      juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                                             "Load wavetable failed",
+                                                                             err.isEmpty() ? "Unknown error." : err);
+                                      return;
+                                  }
 
-        juce::String err;
-        if (! proc.loadWtgenSlot (slot, file, err))
-        {
-            juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                   "Load wavetable failed",
-                                                   err.isEmpty() ? "Unknown error." : err);
-            return;
-        }
-
-        refreshLabels();
+                                  refreshLabels();
+                              });
     }
 
     BasicInstrumentAudioProcessor& proc;
@@ -1205,6 +1217,8 @@ private:
     juce::TextButton loadWT[4];
     juce::Label wtName[4];
 
+    std::unique_ptr<juce::FileChooser> chooser;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BasicInstrumentAudioProcessorEditor)
 };
 
@@ -1223,4 +1237,5 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new BasicInstrumentAudioProcessor();
 }
+
 
