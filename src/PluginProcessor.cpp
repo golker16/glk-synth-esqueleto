@@ -1,495 +1,6 @@
 #include "PluginProcessor.h"
 
-#include <array>
-#include <vector>
 #include <cmath>
-#include <cstdint>
-#include <cstring>
-
-//==============================================================================
-// WTGEN loader + DSP helpers (single-file, sin archivos extra)
-namespace wtgen
-{
-    static inline bool isPowerOfTwo (int x) { return x > 0 && (x & (x - 1)) == 0; }
-
-    struct Reader
-    {
-        const uint8_t* p = nullptr;
-        const uint8_t* end = nullptr;
-
-        Reader (const void* data, size_t size)
-            : p ((const uint8_t*) data), end ((const uint8_t*) data + size) {}
-
-        bool canRead (size_t n) const { return p + n <= end; }
-
-        bool readBytes (void* dst, size_t n)
-        {
-            if (! canRead (n)) return false;
-            std::memcpy (dst, p, n);
-            p += n;
-            return true;
-        }
-
-        bool readU16LE (uint16_t& out)
-        {
-            uint8_t b[2];
-            if (! readBytes (b, 2)) return false;
-            out = (uint16_t) (b[0] | (uint16_t) (b[1] << 8));
-            return true;
-        }
-
-        bool readI16LE (int16_t& out)
-        {
-            uint16_t u = 0;
-            if (! readU16LE (u)) return false;
-            out = (int16_t) u;
-            return true;
-        }
-    };
-
-    static inline juce::DynamicObject* asObject (const juce::var& v)
-    {
-        return v.getDynamicObject();
-    }
-
-    static bool getString (juce::DynamicObject* obj, const juce::Identifier& key, juce::String& out)
-    {
-        if (obj == nullptr) return false;
-        auto vv = obj->getProperty (key);
-        if (! vv.isString()) return false;
-        out = vv.toString();
-        return true;
-    }
-
-    static bool getInt (juce::DynamicObject* obj, const juce::Identifier& key, int& out)
-    {
-        if (obj == nullptr) return false;
-        auto vv = obj->getProperty (key);
-        if (! vv.isInt() && ! vv.isDouble()) return false;
-        out = (int) vv;
-        return true;
-    }
-
-    static bool getFloat (juce::DynamicObject* obj, const juce::Identifier& key, float& out)
-    {
-        if (obj == nullptr) return false;
-        auto vv = obj->getProperty (key);
-        if (! vv.isInt() && ! vv.isDouble()) return false;
-        out = (float) (double) vv;
-        return true;
-    }
-
-    static inline juce::dsp::Complex<float> conjC (juce::dsp::Complex<float> c)
-    {
-        c.imag = -c.imag;
-        return c;
-    }
-
-    // Minimum-phase reconstruction from magnitude via cepstrum.
-    static bool minimumPhaseFromMagnitude (const std::vector<float>& magHalf, std::vector<float>& outTime)
-    {
-        const int N = (int) outTime.size();
-        if (! isPowerOfTwo (N)) return false;
-        if ((int) magHalf.size() != (N / 2 + 1)) return false;
-
-        const int order = (int) std::round (std::log2 ((double) N));
-        juce::dsp::FFT fft (order);
-
-        using C = juce::dsp::Complex<float>;
-
-        std::vector<C> spec ((size_t) N);
-        std::vector<C> tmp  ((size_t) N);
-
-        constexpr float eps = 1.0e-12f;
-
-        // build log|X| with Hermitian symmetry (imag=0)
-        for (int k = 0; k <= N / 2; ++k)
-        {
-            const float m = juce::jmax (magHalf[(size_t) k], eps);
-            spec[(size_t) k].real = std::log (m);
-            spec[(size_t) k].imag = 0.0f;
-        }
-        for (int k = N / 2 + 1; k < N; ++k)
-            spec[(size_t) k] = conjC (spec[(size_t) (N - k)]);
-
-        // IFFT -> real cepstrum (stored in tmp)
-        fft.perform (spec.data(), tmp.data(), true);
-        for (int n = 0; n < N; ++n)
-        {
-            tmp[(size_t) n].real /= (float) N;
-            tmp[(size_t) n].imag /= (float) N;
-        }
-
-        // causal cepstrum
-        for (int n = 1; n < N; ++n)
-        {
-            if (n < N / 2)
-            {
-                tmp[(size_t) n].real *= 2.0f;
-                tmp[(size_t) n].imag *= 2.0f;
-            }
-            else if (n > N / 2)
-            {
-                tmp[(size_t) n].real = 0.0f;
-                tmp[(size_t) n].imag = 0.0f;
-            }
-        }
-
-        // FFT -> min-phase log spectrum
-        fft.perform (tmp.data(), spec.data(), false);
-
-        // exp(log spectrum)
-        for (int k = 0; k < N; ++k)
-        {
-            const float a = spec[(size_t) k].real;
-            const float b = spec[(size_t) k].imag;
-            const float ea = std::exp (a);
-            spec[(size_t) k].real = ea * std::cos (b);
-            spec[(size_t) k].imag = ea * std::sin (b);
-        }
-
-        // enforce Hermitian
-        spec[0].imag = 0.0f;
-        spec[(size_t) (N / 2)].imag = 0.0f;
-        for (int k = N / 2 + 1; k < N; ++k)
-            spec[(size_t) k] = conjC (spec[(size_t) (N - k)]);
-
-        // IFFT -> time
-        fft.perform (spec.data(), tmp.data(), true);
-        for (int n = 0; n < N; ++n)
-            outTime[(size_t) n] = tmp[(size_t) n].real / (float) N;
-
-        return true;
-    }
-
-    static void removeDCAndNormalize (juce::AudioBuffer<float>& buf)
-    {
-        const int ch = buf.getNumChannels();
-        const int n  = buf.getNumSamples();
-        if (ch <= 0 || n <= 0) return;
-
-        // DC remove per channel
-        for (int c = 0; c < ch; ++c)
-        {
-            auto* x = buf.getWritePointer (c);
-            double mean = 0.0;
-            for (int i = 0; i < n; ++i) mean += x[i];
-            mean /= (double) n;
-            for (int i = 0; i < n; ++i) x[i] = (float) (x[i] - mean);
-        }
-
-        // global peak normalize
-        float peak = 0.0f;
-        for (int c = 0; c < ch; ++c)
-            peak = juce::jmax (peak, buf.getMagnitude (c, 0, n));
-
-        if (peak > 1.0e-6f)
-            buf.applyGain (1.0f / peak);
-    }
-
-    // very lightweight band-noise distribution into magnitude bins
-    static void addNoiseBandsToMagnitude (std::vector<float>& magHalf,
-                                         const std::vector<float>& bandAmp)
-    {
-        const int half = (int) magHalf.size() - 1; // N/2
-        const int B = (int) bandAmp.size();
-        if (half <= 0 || B <= 0) return;
-
-        const int bins = half;
-        for (int b = 0; b < B; ++b)
-        {
-            const int start = 1 + (b * bins) / B;
-            const int end   = 1 + ((b + 1) * bins) / B;
-            const float a   = bandAmp[(size_t) b];
-
-            for (int k = start; k < juce::jmin (end, half + 1); ++k)
-                magHalf[(size_t) k] += a;
-        }
-    }
-
-    struct FramepackParams
-    {
-        int tableSize = 0;
-        int frames = 0;
-
-        int harmonics = 0;
-        int noiseBands = 0;
-
-        float ampScale = 1.0f;
-
-        float noiseDbRange = 60.0f;
-        float noiseQuantDb = 120.0f;
-    };
-
-    // Decodes HNFPv1\0 framepack into contiguous time frames (1 channel, frames*N samples)
-    static bool decodeFramepackToContiguous (const void* bytes, size_t size,
-                                            const FramepackParams& fp,
-                                            juce::AudioBuffer<float>& outContiguous,
-                                            juce::String& err)
-    {
-        Reader r (bytes, size);
-
-        // magic "HNFPv1\0" (7 bytes)
-        char magic[7] {};
-        if (! r.readBytes (magic, 7))
-        {
-            err = "Framepack: truncado (sin magic).";
-            return false;
-        }
-        if (std::memcmp (magic, "HNFPv1\0", 7) != 0)
-        {
-            err = "Framepack: magic invalido (no es HNFPv1).";
-            return false;
-        }
-
-        uint16_t tableSizeU = 0, framesU = 0, HU = 0, BU = 0;
-        if (! r.readU16LE (tableSizeU) || ! r.readU16LE (framesU) || ! r.readU16LE (HU) || ! r.readU16LE (BU))
-        {
-            err = "Framepack: header truncado.";
-            return false;
-        }
-
-        const int N = (int) tableSizeU;
-        const int F = (int) framesU;
-        const int H = (int) HU;
-        const int B = (int) BU;
-
-        if (N <= 0 || F <= 0)
-        {
-            err = "Framepack: dimensiones invalidas.";
-            return false;
-        }
-        if (! isPowerOfTwo (N))
-        {
-            err = "Framepack: tableSize debe ser potencia de 2.";
-            return false;
-        }
-
-        // Basic validation vs JSON-declared
-        if (fp.tableSize > 0 && fp.tableSize != N) { err = "Framepack: tableSize no coincide con JSON."; return false; }
-        if (fp.frames   > 0 && fp.frames   != F) { err = "Framepack: frames no coincide con JSON."; return false; }
-
-        outContiguous.setSize (1, F * N, false, false, true);
-        outContiguous.clear();
-
-        std::vector<float> magHalf ((size_t) (N / 2 + 1), 0.0f);
-        std::vector<float> time    ((size_t) N, 0.0f);
-
-        for (int f = 0; f < F; ++f)
-        {
-            std::fill (magHalf.begin(), magHalf.end(), 0.0f);
-
-            // harmonics: H * u16
-            for (int h = 0; h < H; ++h)
-            {
-                uint16_t ampQ = 0;
-                if (! r.readU16LE (ampQ))
-                {
-                    err = "Framepack: truncado leyendo harmonics.";
-                    return false;
-                }
-
-                const float amp = ((float) ampQ / 65535.0f) * fp.ampScale;
-                const int bin = 1 + h;
-                if (bin <= N / 2)
-                    magHalf[(size_t) bin] = amp;
-            }
-
-            // noise: B * i16
-            std::vector<float> bandAmp;
-            if (B > 0) bandAmp.resize ((size_t) B, 0.0f);
-
-            for (int b = 0; b < B; ++b)
-            {
-                int16_t q = 0;
-                if (! r.readI16LE (q))
-                {
-                    err = "Framepack: truncado leyendo noise.";
-                    return false;
-                }
-
-                // map int16 -> [0..1]
-                const float norm = ((float) q + 32768.0f) / 65535.0f;
-
-                // approximate dB in [-range..0]
-                const float db = -fp.noiseDbRange + norm * fp.noiseDbRange;
-                const float a  = std::pow (10.0f, db / 20.0f);
-
-                bandAmp[(size_t) b] = a;
-            }
-
-            // phase lock: 3*u16 (consume, ignored)
-            uint16_t ph0 = 0, ph1 = 0, ph2 = 0;
-            if (! r.readU16LE (ph0) || ! r.readU16LE (ph1) || ! r.readU16LE (ph2))
-            {
-                err = "Framepack: truncado leyendo phase-lock.";
-                return false;
-            }
-
-            // add noise
-            if (B > 0)
-                addNoiseBandsToMagnitude (magHalf, bandAmp);
-
-            // minimum-phase -> time
-            std::fill (time.begin(), time.end(), 0.0f);
-            if (! minimumPhaseFromMagnitude (magHalf, time))
-            {
-                err = "Framepack: fallo minimum-phase.";
-                return false;
-            }
-
-            auto* dst = outContiguous.getWritePointer (0) + f * N;
-            for (int i = 0; i < N; ++i)
-                dst[i] = time[(size_t) i];
-        }
-
-        return true;
-    }
-
-    // Parse WTGEN JSON -> Wavetable (frames x tableSize)
-    static bool loadWtgenJsonToWavetable (const juce::String& jsonText,
-                                         BasicInstrumentAudioProcessor::Wavetable::Ptr& outWT,
-                                         juce::String& err)
-    {
-        err.clear();
-
-        // JUCE de tu proyecto: JSON::parse devuelve Result y llena un var&
-        juce::var root;
-        juce::Result res = juce::JSON::parse (jsonText, root);
-        if (res.failed())
-        {
-            err = "JSON invalido: " + res.getErrorMessage();
-            return false;
-        }
-
-        auto* robj = asObject (root);
-        if (robj == nullptr)
-        {
-            err = "JSON: root no es objeto.";
-            return false;
-        }
-
-        juce::String schema;
-        if (! getString (robj, "schema", schema) || schema != "wtgen-1")
-        {
-            err = "JSON: schema no soportado (se esperaba wtgen-1).";
-            return false;
-        }
-
-        // program
-        auto* pobj = asObject (robj->getProperty ("program"));
-        if (pobj == nullptr)
-        {
-            err = "JSON: falta program.";
-            return false;
-        }
-
-        auto nodesV = pobj->getProperty ("nodes");
-        if (! nodesV.isArray() || nodesV.getArray()->isEmpty())
-        {
-            err = "JSON: program.nodes vacio.";
-            return false;
-        }
-
-        auto node0 = nodesV.getArray()->getReference (0);
-        auto* n0 = asObject (node0);
-        if (n0 == nullptr)
-        {
-            err = "JSON: nodes[0] invalido.";
-            return false;
-        }
-
-        juce::String op;
-        if (! getString (n0, "op", op) || op != "spectralData")
-        {
-            err = "JSON: op no soportado (se esperaba spectralData).";
-            return false;
-        }
-
-        auto* pObj = asObject (n0->getProperty ("p"));
-        if (pObj == nullptr)
-        {
-            err = "JSON: falta nodes[0].p.";
-            return false;
-        }
-
-        juce::String codec;
-        if (! getString (pObj, "codec", codec) || codec != "harm-noise-framepack-v1")
-        {
-            err = "JSON: codec no soportado (se esperaba harm-noise-framepack-v1).";
-            return false;
-        }
-
-        FramepackParams fp;
-        getInt (pObj, "tableSize", fp.tableSize);
-        getInt (pObj, "frames", fp.frames);
-
-        // harmonics object
-        if (auto hv = pObj->getProperty ("harmonics"); hv.getDynamicObject() != nullptr)
-        {
-            auto* hObj = hv.getDynamicObject();
-            int hc = 0;
-            float ampScale = 1.0f;
-            getInt (hObj, "count", hc);
-            getFloat (hObj, "ampScale", ampScale);
-            fp.harmonics = hc;
-            fp.ampScale  = ampScale;
-        }
-
-        // noise object
-        if (auto nv = pObj->getProperty ("noise"); nv.getDynamicObject() != nullptr)
-        {
-            auto* nObj = nv.getDynamicObject();
-            int bands = 0;
-            float dbRange = 60.0f;
-            float quantDb = 120.0f;
-            getInt (nObj, "bands", bands);
-            getFloat (nObj, "dbRange", dbRange);
-            getFloat (nObj, "quantDb", quantDb);
-            fp.noiseBands    = bands;
-            fp.noiseDbRange  = dbRange;
-            fp.noiseQuantDb  = quantDb;
-        }
-
-        juce::String b64;
-        if (! getString (pObj, "data", b64) || b64.isEmpty())
-        {
-            err = "JSON: falta nodes[0].p.data (base64).";
-            return false;
-        }
-
-        // TU JUCE: Base64::convertFromBase64 solo acepta OutputStream&
-        juce::MemoryOutputStream mo;
-        if (! juce::Base64::convertFromBase64 (mo, b64))
-        {
-            err = "JSON: base64 invalido.";
-            return false;
-        }
-        const auto& bin = mo.getMemoryBlock();
-
-        juce::AudioBuffer<float> contiguous;
-        if (! decodeFramepackToContiguous (bin.getData(), bin.getSize(), fp, contiguous, err))
-            return false;
-
-        // Create Wavetable object
-        auto wt = new BasicInstrumentAudioProcessor::Wavetable();
-        wt->tableSize = fp.tableSize;
-        wt->frames    = fp.frames;
-        wt->table.setSize (fp.frames, fp.tableSize, false, false, true);
-
-        const float* src = contiguous.getReadPointer (0);
-        for (int f = 0; f < fp.frames; ++f)
-            std::memcpy (wt->table.getWritePointer (f),
-                         src + f * fp.tableSize,
-                         sizeof (float) * (size_t) fp.tableSize);
-
-        // Robust post
-        removeDCAndNormalize (wt->table);
-
-        outWT = wt;
-        return true;
-    }
-}
 
 //==============================================================================
 // Synth Sound (dummy)
@@ -500,14 +11,375 @@ struct SineSound : public juce::SynthesiserSound
 };
 
 //==============================================================================
-// Synth Voice (Wavetable, 4 oscs)
+// Helpers (static, only inside this TU)
+namespace
+{
+    // ------------------------------
+    // Little-endian readers
+    static inline bool canRead (const juce::uint8* ptr, size_t size, size_t offset, size_t bytes)
+    {
+        return (offset + bytes) <= size && ptr != nullptr;
+    }
+
+    static inline juce::uint16 readLEU16 (const juce::uint8* ptr, size_t size, size_t& off)
+    {
+        if (! canRead (ptr, size, off, 2))
+            return 0;
+
+        const auto lo = (juce::uint16) ptr[off + 0];
+        const auto hi = (juce::uint16) ptr[off + 1];
+        off += 2;
+        return (juce::uint16) (lo | (hi << 8));
+    }
+
+    static inline juce::int16 readLEI16 (const juce::uint8* ptr, size_t size, size_t& off)
+    {
+        const auto u = readLEU16 (ptr, size, off);
+        return (juce::int16) u;
+    }
+
+    // ------------------------------
+    // JUCE var JSON navigation helpers
+    static juce::String varToString (const juce::var& v)
+    {
+        if (v.isString())
+            return v.toString();
+        return {};
+    }
+
+    static juce::var getProp (const juce::var& objVar, const juce::Identifier& key)
+    {
+        if (auto* obj = objVar.getDynamicObject())
+            return obj->getProperty (key);
+        return {};
+    }
+
+    static const juce::Array<juce::var>* getArray (const juce::var& v)
+    {
+        return v.getArray();
+    }
+
+    static juce::var arrayAt (const juce::var& arrVar, int index)
+    {
+        if (auto* arr = getArray (arrVar))
+            if (juce::isPositiveAndBelow (index, arr->size()))
+                return arr->getReference (index);
+        return {};
+    }
+
+    // ------------------------------
+    // Band edges helper (must match exporter)
+    static std::vector<int> linearBandEdges (int loBin, int hiBin, int bands)
+    {
+        bands = juce::jmax (1, bands);
+        loBin = juce::jmax (0, loBin);
+        hiBin = juce::jmax (loBin, hiBin);
+
+        const int total = hiBin - loBin;
+        std::vector<int> edges;
+        edges.reserve ((size_t) bands + 1);
+
+        edges.push_back (loBin);
+        for (int i = 1; i < bands; ++i)
+        {
+            // floor(lo + i * total / bands)
+            const double t = (double) i / (double) bands;
+            const int edge = loBin + (int) std::floor (t * (double) total);
+            edges.push_back (edge);
+        }
+        edges.push_back (hiBin);
+        return edges;
+    }
+
+    // ------------------------------
+    // Minimum-phase reconstruction from magnitude spectrum (real signal)
+    // Implements the standard real-cepstrum method (same concept as the Python reference).
+    static bool minimumPhaseFromMagRfft (const std::vector<float>& magRfft, int N, std::vector<float>& outTime)
+    {
+        if (N <= 0)
+            return false;
+
+        const int nBins = (N / 2) + 1;
+        if ((int) magRfft.size() != nBins)
+            return false;
+
+        const float eps = 1.0e-12f;
+        const int order = (int) std::round (std::log2 ((double) N));
+        if ((1 << order) != N)
+            return false;
+
+        juce::dsp::FFT fft (order);
+        using Complex = juce::dsp::Complex<float>;
+
+        // Build full even log-magnitude spectrum (length N)
+        std::vector<Complex> X ((size_t) N);
+        for (int k = 0; k < N; ++k)
+        {
+            const int rk = (k <= N / 2) ? k : (N - k);
+            const float m = juce::jmax (magRfft[(size_t) rk], eps);
+            X[(size_t) k] = Complex (std::log (m), 0.0f);
+        }
+
+        // Real cepstrum: c = IFFT(log|X|)
+        fft.perform (X.data(), X.data(), true);
+        const float invN = 1.0f / (float) N;
+        for (int n = 0; n < N; ++n)
+            X[(size_t) n] *= invN;
+
+        // Minimum-phase cepstrum shaping
+        for (int n = 1; n < N; ++n)
+        {
+            if (n < N / 2)
+                X[(size_t) n] *= 2.0f;
+            else if (n > N / 2)
+                X[(size_t) n] = Complex (0.0f, 0.0f);
+        }
+
+        // Back to frequency domain: L = FFT(c_min)
+        fft.perform (X.data(), X.data(), false);
+
+        // Exponentiate: H = exp(L)
+        for (int k = 0; k < N; ++k)
+        {
+            const float a = X[(size_t) k].real();
+            const float b = X[(size_t) k].imag();
+            const float ea = std::exp (a);
+            X[(size_t) k] = Complex (ea * std::cos (b), ea * std::sin (b));
+        }
+
+        // IFFT to get time-domain minimum-phase frame
+        fft.perform (X.data(), X.data(), true);
+        for (int n = 0; n < N; ++n)
+            X[(size_t) n] *= invN;
+
+        outTime.resize ((size_t) N);
+        for (int n = 0; n < N; ++n)
+            outTime[(size_t) n] = X[(size_t) n].real();
+
+        return true;
+    }
+
+    // ------------------------------
+    // Parse a wtgen-1 JSON and return a constructed wavetable
+    static bool buildWavetableFromWtgenJson (const juce::String& jsonText,
+                                             const juce::String& nameHint,
+                                             BasicInstrumentAudioProcessor::Wavetable::Ptr& outWt,
+                                             juce::String& err)
+    {
+        outWt = nullptr;
+
+        juce::var root;
+        const auto parseRes = juce::JSON::parse (jsonText, root);
+        if (parseRes.failed())
+        {
+            err = "JSON parse failed: " + parseRes.getErrorMessage();
+            return false;
+        }
+
+        const auto schema = varToString (getProp (root, "schema"));
+        if (schema != "wtgen-1")
+        {
+            err = "Invalid schema (expected wtgen-1)";
+            return false;
+        }
+
+        const auto program = getProp (root, "program");
+        const auto nodes = getProp (program, "nodes");
+        const auto node0 = arrayAt (nodes, 0);
+
+        const auto op = varToString (getProp (node0, "op"));
+        if (op != "spectralData")
+        {
+            err = "Unsupported program.nodes[0].op (expected spectralData)";
+            return false;
+        }
+
+        const auto p = getProp (node0, "p");
+        const auto codec = varToString (getProp (p, "codec"));
+        if (codec != "harm-noise-framepack-v1")
+        {
+            err = "Unsupported codec (expected harm-noise-framepack-v1)";
+            return false;
+        }
+
+        const auto dataB64 = varToString (getProp (p, "data"));
+        if (dataB64.isEmpty())
+        {
+            err = "Missing program.nodes[0].p.data";
+            return false;
+        }
+
+        // Optional banding info (needed to spread noise bands)
+        int loBin = 0;
+        int hiBin = 0;
+        {
+            const auto noise = getProp (p, "noise");
+            const auto banding = getProp (noise, "banding");
+            loBin = (int) getProp (banding, "loBin");
+            hiBin = (int) getProp (banding, "hiBin");
+        }
+
+        // Base64 decode into MemoryBlock
+        juce::MemoryOutputStream mo;
+        if (! juce::Base64::convertFromBase64 (mo, dataB64))
+        {
+            err = "Base64 decode failed";
+            return false;
+        }
+
+        const auto mb = mo.getMemoryBlock();
+        const auto* bytes = (const juce::uint8*) mb.getData();
+        const auto size = (size_t) mb.getSize();
+
+        // Decode header
+        size_t off = 0;
+        static constexpr juce::uint8 magic[7] = { 'H','N','F','P','v','1','\0' };
+        if (! canRead (bytes, size, off, sizeof (magic)))
+        {
+            err = "Corrupt data (too small)";
+            return false;
+        }
+
+        if (std::memcmp (bytes + off, magic, sizeof (magic)) != 0)
+        {
+            err = "Invalid magic (expected HNFPv1\\0)";
+            return false;
+        }
+        off += sizeof (magic);
+
+        const int tableSize = (int) readLEU16 (bytes, size, off);
+        const int F = (int) readLEU16 (bytes, size, off);
+        const int H = (int) readLEU16 (bytes, size, off);
+        const int B = (int) readLEU16 (bytes, size, off);
+
+        if (tableSize <= 0 || F <= 0)
+        {
+            err = "Invalid header (tableSize/frames)";
+            return false;
+        }
+        if (H < 0 || B < 0)
+        {
+            err = "Invalid header (H/B)";
+            return false;
+        }
+        if (tableSize != (1 << (int) std::round (std::log2 ((double) tableSize))))
+        {
+            err = "tableSize must be power-of-two (for FFT)";
+            return false;
+        }
+
+        const int N = tableSize;
+        const int nBins = (N / 2) + 1;
+
+        if (hiBin <= 0)
+            hiBin = nBins - 1;
+        if (loBin <= 0)
+            loBin = juce::jlimit (0, nBins - 1, H + 1);
+
+        const auto edges = linearBandEdges (loBin, hiBin, juce::jmax (1, B));
+
+        // Validate size expectation (best-effort)
+        const size_t perFrameBytes = (size_t) H * 2 + (size_t) B * 2 + 3 * 2;
+        const size_t expectedMin = sizeof (magic) + 4 * 2 + (size_t) F * perFrameBytes;
+        if (size < expectedMin)
+        {
+            err = "Corrupt data (truncated framepack)";
+            return false;
+        }
+
+        auto wt = BasicInstrumentAudioProcessor::Wavetable::Ptr (new BasicInstrumentAudioProcessor::Wavetable());
+        wt->tableSize = tableSize;
+        wt->frames = F;
+        wt->name = nameHint.isNotEmpty() ? nameHint : "Wavetable";
+        wt->table.setSize (F, tableSize);
+        wt->table.clear();
+
+        std::vector<float> mag ((size_t) nBins, 0.0f);
+        std::vector<float> time;
+
+        for (int f = 0; f < F; ++f)
+        {
+            std::fill (mag.begin(), mag.end(), 0.0f);
+
+            // Harmonics (u16)
+            for (int h = 0; h < H; ++h)
+            {
+                const auto q = (float) readLEU16 (bytes, size, off);
+                const float harmAmpScaled = q / 4096.0f;                 // (mag * (2/N))
+                const float binMag = harmAmpScaled * ((float) N * 0.5f); // back to rfft magnitude
+                const int bin = 1 + h;
+                if (bin >= 0 && bin < nBins)
+                    mag[(size_t) bin] = binMag;
+            }
+
+            // Noise bands (i16 dB*2)
+            for (int b = 0; b < B; ++b)
+            {
+                const auto qdb = (float) readLEI16 (bytes, size, off);
+                const float db = qdb * 0.5f;
+                const float rmsScaled = std::pow (10.0f, db / 20.0f);
+                const float binMag = rmsScaled * ((float) N * 0.5f);
+
+                const int a = edges[(size_t) b];
+                const int c = edges[(size_t) b + 1];
+                for (int k = a; k < c && k < nBins; ++k)
+                    mag[(size_t) k] = binMag;
+            }
+
+            // 3*u16 tilt params (ignored for now)
+            (void) readLEU16 (bytes, size, off);
+            (void) readLEU16 (bytes, size, off);
+            (void) readLEU16 (bytes, size, off);
+
+            // Safety: DC and Nyquist to zero
+            if (! mag.empty()) mag[0] = 0.0f;
+            if (nBins > 1) mag[(size_t) (nBins - 1)] = 0.0f;
+
+            if (! minimumPhaseFromMagRfft (mag, N, time))
+            {
+                err = "Minimum-phase reconstruction failed";
+                return false;
+            }
+
+            auto* dst = wt->table.getWritePointer (f);
+            for (int i = 0; i < N; ++i)
+                dst[i] = time[(size_t) i];
+        }
+
+        // DC remove per frame
+        for (int f = 0; f < F; ++f)
+        {
+            auto* dst = wt->table.getWritePointer (f);
+            double sum = 0.0;
+            for (int i = 0; i < N; ++i)
+                sum += dst[i];
+            const float mean = (float) (sum / (double) N);
+            for (int i = 0; i < N; ++i)
+                dst[i] -= mean;
+        }
+
+        // Normalize global peak
+        float peak = 0.0f;
+        for (int f = 0; f < F; ++f)
+            peak = juce::jmax (peak, wt->table.getMagnitude (f, 0, N));
+
+        if (peak > 0.0f)
+            wt->table.applyGain (0.999f / peak);
+
+        outWt = wt;
+        return true;
+    }
+}
+
+//==============================================================================
+// Synth Voice: 4-osc wavetable
 struct WavetableVoice : public juce::SynthesiserVoice
 {
     void setParameters (juce::AudioProcessorValueTreeState& apvtsRef,
                         BasicInstrumentAudioProcessor& procRef)
     {
         apvts = &apvtsRef;
-        proc  = &procRef;
+        proc = &procRef;
 
         gainParam    = apvts->getRawParameterValue ("gain");
         attackParam  = apvts->getRawParameterValue ("attack");
@@ -515,11 +387,11 @@ struct WavetableVoice : public juce::SynthesiserVoice
         sustainParam = apvts->getRawParameterValue ("sustain");
         releaseParam = apvts->getRawParameterValue ("release");
 
-        morphParam   = apvts->getRawParameterValue ("wt_morph");
-        oscLevel[0]  = apvts->getRawParameterValue ("osc1_level");
-        oscLevel[1]  = apvts->getRawParameterValue ("osc2_level");
-        oscLevel[2]  = apvts->getRawParameterValue ("osc3_level");
-        oscLevel[3]  = apvts->getRawParameterValue ("osc4_level");
+        morphParam = apvts->getRawParameterValue ("wt_morph");
+        oscLevelParam[0] = apvts->getRawParameterValue ("osc1_level");
+        oscLevelParam[1] = apvts->getRawParameterValue ("osc2_level");
+        oscLevelParam[2] = apvts->getRawParameterValue ("osc3_level");
+        oscLevelParam[3] = apvts->getRawParameterValue ("osc4_level");
     }
 
     bool canPlaySound (juce::SynthesiserSound* s) override
@@ -532,14 +404,14 @@ struct WavetableVoice : public juce::SynthesiserVoice
     {
         level = juce::jlimit (0.0f, 1.0f, velocity);
 
-        const auto freq = juce::MidiMessage::getMidiNoteInHertz (midiNoteNumber);
-        const double sr = getSampleRate();
-        const double inc = (sr > 0.0 ? freq / sr : 0.0);
+        const auto freq = (float) juce::MidiMessage::getMidiNoteInHertz (midiNoteNumber);
+        const float sr = (float) getSampleRate();
+        const float delta = (sr > 0.0f ? (freq / sr) : 0.0f); // cycles/sample
 
         for (int i = 0; i < 4; ++i)
         {
-            phase[i] = 0.0;
-            phaseDelta[i] = inc;
+            phase[i] = 0.0f;
+            phaseDelta[i] = delta;
         }
 
         updateADSR();
@@ -553,7 +425,8 @@ struct WavetableVoice : public juce::SynthesiserVoice
         {
             adsr.reset();
             clearCurrentNote();
-            for (auto& d : phaseDelta) d = 0.0;
+            for (int i = 0; i < 4; ++i)
+                phaseDelta[i] = 0.0f;
         }
     }
 
@@ -565,86 +438,98 @@ struct WavetableVoice : public juce::SynthesiserVoice
         if (apvts == nullptr || proc == nullptr)
             return;
 
-        // Copy slot pointers ONCE per block (no lock per sample)
-        BasicInstrumentAudioProcessor::Wavetable::Ptr wt[4];
-        for (int i = 0; i < 4; ++i)
-            wt[i] = proc->getWtSlot (i);
+        if (phaseDelta[0] == 0.0f)
+            return;
 
         updateADSR();
 
         const float masterGain = (gainParam ? gainParam->load() : 0.8f);
-        const float morph      = (morphParam ? morphParam->load() : 0.0f);
+        const float morph = (morphParam ? juce::jlimit (0.0f, 1.0f, morphParam->load()) : 0.0f);
 
-        float mixLevel[4] {};
+        float oscLevels[4] = { 1.0f, 0.0f, 0.0f, 0.0f };
         for (int i = 0; i < 4; ++i)
-            mixLevel[i] = (oscLevel[i] ? oscLevel[i]->load() : (i == 0 ? 1.0f : 0.0f));
+            if (oscLevelParam[i] != nullptr)
+                oscLevels[i] = juce::jlimit (0.0f, 1.0f, oscLevelParam[i]->load());
 
-        auto sampleWT = [] (const BasicInstrumentAudioProcessor::Wavetable& w, float morph01, double ph) -> float
-        {
-            const int N = w.tableSize;
-            const int F = w.frames;
-            if (N <= 0 || F <= 0) return 0.0f;
-
-            const float framePos = juce::jlimit (0.0f, 1.0f, morph01) * (float) (F - 1);
-            const int f0 = (int) std::floor (framePos);
-            const int f1 = juce::jmin (f0 + 1, F - 1);
-            const float tf = framePos - (float) f0;
-
-            const double p = ph - std::floor (ph); // wrap [0..1)
-            const double idx = p * (double) N;
-            const int i0 = (int) idx;
-            const int i1 = (i0 + 1) % N;
-            const float t = (float) (idx - (double) i0);
-
-            const float a0 = w.table.getSample (f0, i0);
-            const float a1 = w.table.getSample (f0, i1);
-            const float b0 = w.table.getSample (f1, i0);
-            const float b1 = w.table.getSample (f1, i1);
-
-            const float sa = a0 + (a1 - a0) * t;
-            const float sb = b0 + (b1 - b0) * t;
-
-            return sa + (sb - sa) * tf;
-        };
+        // Copy wavetables ONCE per block (no per-sample locks)
+        std::array<BasicInstrumentAudioProcessor::Wavetable::Ptr, 4> wts;
+        proc->getWtSlotsSnapshot (wts);
 
         while (numSamples-- > 0)
         {
             const float env = adsr.getNextSample();
 
             float mix = 0.0f;
-
             for (int k = 0; k < 4; ++k)
             {
+                const float lvl = oscLevels[k];
+                if (lvl <= 0.0001f)
+                {
+                    phase[k] = phaseWrap (phase[k] + phaseDelta[k]);
+                    continue;
+                }
+
                 float s = 0.0f;
-
-                if (wt[k] != nullptr)
-                    s = sampleWT (*wt[k], morph, phase[k]);
+                if (wts[(size_t) k] != nullptr && wts[(size_t) k]->tableSize > 0 && wts[(size_t) k]->frames > 0)
+                    s = sampleWavetable (*wts[(size_t) k], phase[k], morph);
                 else
-                    s = 0.0f;
+                    s = std::sin (phase[k] * juce::MathConstants<float>::twoPi);
 
-                mix += s * mixLevel[k];
-
-                phase[k] += phaseDelta[k];
-                if (phase[k] >= 1.0) phase[k] -= 1.0;
+                mix += s * lvl;
+                phase[k] = phaseWrap (phase[k] + phaseDelta[k]);
             }
 
-            const float outSamp = mix * (level * env * masterGain);
+            const float s = mix * (level * env * masterGain);
 
             for (int ch = 0; ch < out.getNumChannels(); ++ch)
-                out.addSample (ch, startSample, outSamp);
+                out.addSample (ch, startSample, s);
 
             ++startSample;
 
             if (! adsr.isActive())
             {
                 clearCurrentNote();
-                for (auto& d : phaseDelta) d = 0.0;
+                for (int i = 0; i < 4; ++i)
+                    phaseDelta[i] = 0.0f;
                 break;
             }
         }
     }
 
 private:
+    static inline float phaseWrap (float x)
+    {
+        x -= std::floor (x);
+        return x;
+    }
+
+    static float sampleWavetable (const BasicInstrumentAudioProcessor::Wavetable& wt,
+                                  float phase01,
+                                  float morph)
+    {
+        const int N = wt.tableSize;
+        const int F = wt.frames;
+        if (N <= 1 || F <= 0)
+            return 0.0f;
+
+        const float framePos = morph * (float) (F - 1);
+        const int a = (int) std::floor (framePos);
+        const int b = juce::jmin (a + 1, F - 1);
+        const float tf = framePos - (float) a;
+
+        const float idx = phase01 * (float) N;
+        const int i0 = (int) std::floor (idx) % N;
+        const int i1 = (i0 + 1) % N;
+        const float sf = idx - (float) std::floor (idx);
+
+        const auto* pa = wt.table.getReadPointer (a);
+        const auto* pb = wt.table.getReadPointer (b);
+
+        const float sa = juce::jmap (sf, pa[i0], pa[i1]);
+        const float sb = juce::jmap (sf, pb[i0], pb[i1]);
+        return juce::jmap (tf, sa, sb);
+    }
+
     void updateADSR()
     {
         if (apvts == nullptr) return;
@@ -657,8 +542,8 @@ private:
         adsr.setParameters (p);
     }
 
-    juce::AudioProcessorValueTreeState* apvts = nullptr;
     BasicInstrumentAudioProcessor* proc = nullptr;
+    juce::AudioProcessorValueTreeState* apvts = nullptr;
 
     std::atomic<float>* gainParam    = nullptr;
     std::atomic<float>* attackParam  = nullptr;
@@ -666,15 +551,14 @@ private:
     std::atomic<float>* sustainParam = nullptr;
     std::atomic<float>* releaseParam = nullptr;
 
-    std::atomic<float>* morphParam   = nullptr;
-    std::atomic<float>* oscLevel[4]  = { nullptr, nullptr, nullptr, nullptr };
+    std::atomic<float>* morphParam = nullptr;
+    std::atomic<float>* oscLevelParam[4] = { nullptr, nullptr, nullptr, nullptr };
 
     juce::ADSR adsr;
 
-    std::array<double, 4> phase      { 0.0, 0.0, 0.0, 0.0 };
-    std::array<double, 4> phaseDelta { 0.0, 0.0, 0.0, 0.0 };
-
-    float level = 0.0f;
+    float phase[4]      = { 0, 0, 0, 0 };
+    float phaseDelta[4] = { 0, 0, 0, 0 };
+    float level         = 0.0f;
 };
 
 //==============================================================================
@@ -715,89 +599,35 @@ BasicInstrumentAudioProcessor::createParameterLayout()
         0.20f
     ));
 
-    // NEW: wavetable morph (0..1)
+    // New wavetable controls
     params.push_back (std::make_unique<P>(
         "wt_morph", "WT Morph",
         juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f),
         0.0f
     ));
 
-    // NEW: 4 osc mix levels
     params.push_back (std::make_unique<P>(
-        "osc1_level", "OSC1 Level",
+        "osc1_level", "Osc1 Level",
         juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f),
         1.0f
     ));
     params.push_back (std::make_unique<P>(
-        "osc2_level", "OSC2 Level",
+        "osc2_level", "Osc2 Level",
         juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f),
         0.0f
     ));
     params.push_back (std::make_unique<P>(
-        "osc3_level", "OSC3 Level",
+        "osc3_level", "Osc3 Level",
         juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f),
         0.0f
     ));
     params.push_back (std::make_unique<P>(
-        "osc4_level", "OSC4 Level",
+        "osc4_level", "Osc4 Level",
         juce::NormalisableRange<float> (0.0f, 1.0f, 0.0001f),
         0.0f
     ));
 
     return { params.begin(), params.end() };
-}
-
-//==============================================================================
-// WT slots API (declared in PluginProcessor.h)
-bool BasicInstrumentAudioProcessor::loadWtgenSlot (int slot, const juce::File& file, juce::String& err)
-{
-    err.clear();
-
-    if (slot < 0 || slot >= 4)
-    {
-        err = "Slot fuera de rango (0..3).";
-        return false;
-    }
-
-    if (! file.existsAsFile())
-    {
-        err = "Archivo no existe.";
-        return false;
-    }
-
-    auto jsonText = file.loadFileAsString();
-    if (jsonText.isEmpty())
-    {
-        err = "Archivo vacío o no se pudo leer.";
-        return false;
-    }
-
-    // parse + decode -> Wavetable
-    BasicInstrumentAudioProcessor::Wavetable::Ptr wt;
-    if (! wtgen::loadWtgenJsonToWavetable (jsonText, wt, err))
-        return false;
-
-    wt->name = file.getFileName();
-
-    // set slot under lock (private members OK here)
-    {
-        const juce::SpinLock::ScopedLockType lock (wtLock);
-        wtSlots[(size_t) slot] = wt;
-    }
-
-    // Persist JSON + name in APVTS state so the host recalls it
-    apvts.state.setProperty ("wt_slot" + juce::String (slot + 1) + "_json", jsonText, nullptr);
-    apvts.state.setProperty ("wt_slot" + juce::String (slot + 1) + "_name", file.getFileName(), nullptr);
-
-    return true;
-}
-
-BasicInstrumentAudioProcessor::Wavetable::Ptr
-BasicInstrumentAudioProcessor::getWtSlot (int slot) const
-{
-    if (slot < 0 || slot >= 4) return nullptr;
-    const juce::SpinLock::ScopedLockType lock (wtLock);
-    return wtSlots[(size_t) slot];
 }
 
 //==============================================================================
@@ -849,10 +679,93 @@ void BasicInstrumentAudioProcessor::processBlock (juce::AudioBuffer<float>& buff
 }
 
 //==============================================================================
-// State (APVTS + JSON per slot)
+// Wavetable slots API
+bool BasicInstrumentAudioProcessor::loadWtgenSlot (int slot, const juce::File& file, juce::String& err)
+{
+    err.clear();
+
+    if (! juce::isPositiveAndBelow (slot, 4))
+    {
+        err = "Invalid slot";
+        return false;
+    }
+
+    if (! file.existsAsFile())
+    {
+        err = "File does not exist";
+        return false;
+    }
+
+    const auto jsonText = file.loadFileAsString();
+    if (jsonText.isEmpty())
+    {
+        err = "Failed to read file";
+        return false;
+    }
+
+    Wavetable::Ptr wt;
+    if (! buildWavetableFromWtgenJson (jsonText, file.getFileNameWithoutExtension(), wt, err))
+        return false;
+
+    {
+        const juce::SpinLock::ScopedLockType sl (wtLock);
+        wtSlots[(size_t) slot] = wt;
+        wtSlotJson[(size_t) slot] = jsonText;
+        wtSlotName[(size_t) slot] = file.getFileName();
+    }
+
+    return true;
+}
+
+BasicInstrumentAudioProcessor::Wavetable::Ptr BasicInstrumentAudioProcessor::getWtSlot (int slot) const
+{
+    if (! juce::isPositiveAndBelow (slot, 4))
+        return nullptr;
+
+    const juce::SpinLock::ScopedLockType sl (wtLock);
+    return wtSlots[(size_t) slot];
+}
+
+void BasicInstrumentAudioProcessor::getWtSlotsSnapshot (std::array<Wavetable::Ptr, 4>& outSlots) const
+{
+    const juce::SpinLock::ScopedLockType sl (wtLock);
+    outSlots = wtSlots;
+}
+
+juce::String BasicInstrumentAudioProcessor::getWtSlotName (int slot) const
+{
+    if (! juce::isPositiveAndBelow (slot, 4))
+        return {};
+
+    const juce::SpinLock::ScopedLockType sl (wtLock);
+    return wtSlotName[(size_t) slot];
+}
+
+juce::String BasicInstrumentAudioProcessor::getWtSlotJson (int slot) const
+{
+    if (! juce::isPositiveAndBelow (slot, 4))
+        return {};
+
+    const juce::SpinLock::ScopedLockType sl (wtLock);
+    return wtSlotJson[(size_t) slot];
+}
+
+//==============================================================================
+// State
 void BasicInstrumentAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
+
+    // Store WT JSON per slot for portability
+    for (int i = 0; i < 4; ++i)
+    {
+        const auto key = juce::String ("wt_slot") + juce::String (i + 1) + "_json";
+        state.setProperty (key, getWtSlotJson (i), nullptr);
+
+        const auto keyName = juce::String ("wt_slot") + juce::String (i + 1) + "_name";
+        state.setProperty (keyName, getWtSlotName (i), nullptr);
+    }
+
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
     copyXmlToBinary (*xml, destData);
 }
@@ -860,39 +773,37 @@ void BasicInstrumentAudioProcessor::getStateInformation (juce::MemoryBlock& dest
 void BasicInstrumentAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
 {
     std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
-    if (xmlState == nullptr || ! xmlState->hasTagName (apvts.state.getType()))
+    if (xmlState == nullptr)
         return;
 
-    apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
+    if (! xmlState->hasTagName (apvts.state.getType()))
+        return;
 
-    // Restore loaded wavetables from saved JSON blobs (portable)
-    for (int slot = 0; slot < 4; ++slot)
+    auto vt = juce::ValueTree::fromXml (*xmlState);
+    apvts.replaceState (vt);
+
+    // Restore wavetable slots from embedded JSON (best-effort)
+    for (int i = 0; i < 4; ++i)
     {
-        const auto keyJson  = "wt_slot" + juce::String (slot + 1) + "_json";
-        const auto keyName  = "wt_slot" + juce::String (slot + 1) + "_name";
+        const auto key = juce::String ("wt_slot") + juce::String (i + 1) + "_json";
+        const auto json = vt.getProperty (key).toString();
 
-        auto jsonVar = apvts.state.getProperty (keyJson);
-        if (! jsonVar.isString())
-            continue;
-
-        const juce::String jsonText = jsonVar.toString();
-        if (jsonText.isEmpty())
-            continue;
-
-        juce::String name = "(restored)";
-        auto nameVar = apvts.state.getProperty (keyName);
-        if (nameVar.isString() && nameVar.toString().isNotEmpty())
-            name = nameVar.toString();
-
-        juce::String err;
-        BasicInstrumentAudioProcessor::Wavetable::Ptr wt;
-        if (wtgen::loadWtgenJsonToWavetable (jsonText, wt, err))
+        if (json.isNotEmpty())
         {
-            wt->name = name;
-            const juce::SpinLock::ScopedLockType lock (wtLock);
-            wtSlots[(size_t) slot] = wt;
+            juce::String err;
+            Wavetable::Ptr wt;
+
+            const auto keyName = juce::String ("wt_slot") + juce::String (i + 1) + "_name";
+            const auto nameHint = vt.getProperty (keyName).toString();
+
+            if (buildWavetableFromWtgenJson (json, nameHint, wt, err))
+            {
+                const juce::SpinLock::ScopedLockType sl (wtLock);
+                wtSlots[(size_t) i] = wt;
+                wtSlotJson[(size_t) i] = json;
+                wtSlotName[(size_t) i] = nameHint;
+            }
         }
-        // si falla, ignoramos ese slot sin crashear
     }
 }
 
@@ -916,16 +827,15 @@ namespace ui
 
         juce::Font font (float height, int styleFlags = juce::Font::plain) const
         {
-            juce::Font f;
+            juce::Font f (juce::FontOptions (height));
             if (typeface != nullptr)
-                f = juce::Font (typeface);
+                f = juce::Font (typeface).withHeight (height);
 
-            f.setHeight (height);
             f.setStyleFlags (styleFlags);
             return f;
         }
 
-        juce::Typeface::Ptr getTypefaceForFont (const juce::Font&) override
+        juce::Typeface::Ptr getTypefaceForFont (const juce::Font& /*font*/) override
         {
             if (typeface != nullptr)
                 return typeface;
@@ -1034,12 +944,12 @@ class BasicInstrumentAudioProcessorEditor : public juce::AudioProcessorEditor
 public:
     explicit BasicInstrumentAudioProcessorEditor (BasicInstrumentAudioProcessor& p)
     : juce::AudioProcessorEditor (&p), proc (p),
-      knobGain    (p.apvts, "gain",       "GAIN"),
-      knobAttack  (p.apvts, "attack",     "ATTACK"),
-      knobDecay   (p.apvts, "decay",      "DECAY"),
-      knobSustain (p.apvts, "sustain",    "SUSTAIN"),
-      knobRelease (p.apvts, "release",    "RELEASE"),
-      knobMorph   (p.apvts, "wt_morph",   "MORPH"),
+      knobGain    (p.apvts, "gain",    "GAIN"),
+      knobAttack  (p.apvts, "attack",  "ATTACK"),
+      knobDecay   (p.apvts, "decay",   "DECAY"),
+      knobSustain (p.apvts, "sustain", "SUSTAIN"),
+      knobRelease (p.apvts, "release", "RELEASE"),
+      knobMorph   (p.apvts, "wt_morph", "MORPH"),
       knobOsc1    (p.apvts, "osc1_level", "OSC1"),
       knobOsc2    (p.apvts, "osc2_level", "OSC2"),
       knobOsc3    (p.apvts, "osc3_level", "OSC3"),
@@ -1053,42 +963,33 @@ public:
         addAndMakeVisible (title);
 
         auto labelFont = lnf.font (12.0f, juce::Font::bold);
-        for (auto* k : { &knobGain, &knobAttack, &knobDecay, &knobSustain, &knobRelease,
-                         &knobMorph, &knobOsc1, &knobOsc2, &knobOsc3, &knobOsc4 })
+        for (auto* k : { &knobGain, &knobAttack, &knobDecay, &knobSustain, &knobRelease, &knobMorph,
+                         &knobOsc1, &knobOsc2, &knobOsc3, &knobOsc4 })
             k->label.setFont (labelFont);
 
-        addAndMakeVisible (knobGain);
-        addAndMakeVisible (knobAttack);
-        addAndMakeVisible (knobDecay);
-        addAndMakeVisible (knobSustain);
-        addAndMakeVisible (knobRelease);
-        addAndMakeVisible (knobMorph);
+        for (auto* k : { &knobGain, &knobAttack, &knobDecay, &knobSustain, &knobRelease, &knobMorph,
+                         &knobOsc1, &knobOsc2, &knobOsc3, &knobOsc4 })
+            addAndMakeVisible (*k);
 
-        addAndMakeVisible (knobOsc1);
-        addAndMakeVisible (knobOsc2);
-        addAndMakeVisible (knobOsc3);
-        addAndMakeVisible (knobOsc4);
-
-        // 4 botones Load WT + labels
         for (int i = 0; i < 4; ++i)
         {
-            loadWT[i].setButtonText ("LOAD WT" + juce::String (i + 1));
-            loadWT[i].onClick = [this, i] { launchLoadDialog (i); };
-            addAndMakeVisible (loadWT[i]);
+            wtButtons[i].setButtonText ("Load WT" + juce::String (i + 1));
+            wtButtons[i].onClick = [this, i] { chooseAndLoad (i); };
+            addAndMakeVisible (wtButtons[i]);
 
-            wtName[i].setFont (lnf.font (12.0f));
-            wtName[i].setText ("(empty)", juce::dontSendNotification);
-            wtName[i].setJustificationType (juce::Justification::left);
-            addAndMakeVisible (wtName[i]);
+            wtLabels[i].setFont (lnf.font (12.0f));
+            wtLabels[i].setJustificationType (juce::Justification::centredLeft);
+            wtLabels[i].setText ("(empty)", juce::dontSendNotification);
+            addAndMakeVisible (wtLabels[i]);
         }
 
-        setSize (680, 320);
-        refreshLabels();
+        refreshWtLabels();
+
+        setSize (720, 300);
     }
 
     ~BasicInstrumentAudioProcessorEditor() override
     {
-        chooser.reset();
         setLookAndFeel (nullptr);
     }
 
@@ -1107,28 +1008,25 @@ public:
     void resized() override
     {
         auto r = getLocalBounds().reduced (18);
-
         title.setBounds (r.removeFromTop (28));
-        r.removeFromTop (6);
+        r.removeFromTop (8);
 
-        // WT load area (4 rows)
+        // WT buttons + labels
+        auto wtRow = r.removeFromTop (36);
+        for (int i = 0; i < 4; ++i)
         {
-            auto wtArea = r.removeFromTop (92);
-            for (int i = 0; i < 4; ++i)
-            {
-                auto row = wtArea.removeFromTop (20);
-                loadWT[i].setBounds (row.removeFromLeft (100));
-                row.removeFromLeft (8);
-                wtName[i].setBounds (row);
-                wtArea.removeFromTop (2);
-            }
-            r.removeFromTop (8);
+            auto cell = wtRow.removeFromLeft (wtRow.getWidth() / (4 - i));
+            auto btnArea = cell.removeFromTop (22);
+            wtButtons[i].setBounds (btnArea.removeFromLeft (90));
+            wtLabels[i].setBounds (btnArea);
         }
 
-        const int knobW = 64;
-        const int knobH = 112;
+        r.removeFromTop (10);
 
-        // Row 1: gain + ADSR + morph
+        // Knobs
+        const int knobW = 62;
+        const int knobH = 108;
+
         auto row1 = r.removeFromTop (knobH);
         auto place = [&](juce::Component& c)
         {
@@ -1141,83 +1039,66 @@ public:
         place (knobSustain);
         place (knobRelease);
         place (knobMorph);
-
-        r.removeFromTop (6);
-
-        // Row 2: OSC mix
-        auto row2 = r.removeFromTop (knobH);
-        auto place2 = [&](juce::Component& c)
-        {
-            c.setBounds (row2.removeFromLeft (knobW).reduced (3, 0));
-        };
-
-        place2 (knobOsc1);
-        place2 (knobOsc2);
-        place2 (knobOsc3);
-        place2 (knobOsc4);
+        place (knobOsc1);
+        place (knobOsc2);
+        place (knobOsc3);
+        place (knobOsc4);
     }
 
 private:
-    void refreshLabels()
+    void refreshWtLabels()
     {
         for (int i = 0; i < 4; ++i)
         {
-            if (auto wt = proc.getWtSlot (i); wt != nullptr)
-                wtName[i].setText (wt->name, juce::dontSendNotification);
-            else
-                wtName[i].setText ("(empty)", juce::dontSendNotification);
+            const auto name = proc.getWtSlotName (i);
+            wtLabels[i].setText (name.isNotEmpty() ? name : "(empty)", juce::dontSendNotification);
         }
     }
 
-    void launchLoadDialog (int slot)
+    void chooseAndLoad (int slot)
     {
-        chooser.reset (new juce::FileChooser ("Select .wtgen.json wavetable",
-                                             juce::File{},
-                                             "*.json;*.wtgen.json"));
+        fileChooser = std::make_unique<juce::FileChooser> (
+            "Load WTGEN (.wtgen.json)",
+            juce::File(),
+            "*.wtgen.json;*.json");
 
-        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                              [this, slot] (const juce::FileChooser& fc)
-                              {
-                                  auto file = fc.getResult();
-                                  if (! file.existsAsFile())
-                                      return;
+        const int flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+        fileChooser->launchAsync (flags, [this, slot] (const juce::FileChooser& fc)
+        {
+            const auto file = fc.getResult();
+            if (! file.existsAsFile())
+                return;
 
-                                  juce::String err;
-                                  if (! proc.loadWtgenSlot (slot, file, err))
-                                  {
-                                      juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
-                                                                             "Load wavetable failed",
-                                                                             err.isEmpty() ? "Unknown error." : err);
-                                      return;
-                                  }
-
-                                  refreshLabels();
-                              });
+            juce::String err;
+            if (! proc.loadWtgenSlot (slot, file, err))
+            {
+                juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::WarningIcon,
+                                                       "WT Load Error",
+                                                       err);
+            }
+            refreshWtLabels();
+        });
     }
 
     BasicInstrumentAudioProcessor& proc;
-
     ui::BasicLNF lnf;
+
     juce::Label title;
 
-    // knobs
     ui::KnobWithLabel knobGain;
     ui::KnobWithLabel knobAttack;
     ui::KnobWithLabel knobDecay;
     ui::KnobWithLabel knobSustain;
     ui::KnobWithLabel knobRelease;
     ui::KnobWithLabel knobMorph;
-
     ui::KnobWithLabel knobOsc1;
     ui::KnobWithLabel knobOsc2;
     ui::KnobWithLabel knobOsc3;
     ui::KnobWithLabel knobOsc4;
 
-    // WT load UI
-    juce::TextButton loadWT[4];
-    juce::Label wtName[4];
-
-    std::unique_ptr<juce::FileChooser> chooser;
+    std::array<juce::TextButton, 4> wtButtons;
+    std::array<juce::Label, 4> wtLabels;
+    std::unique_ptr<juce::FileChooser> fileChooser;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BasicInstrumentAudioProcessorEditor)
 };
@@ -1237,6 +1118,5 @@ juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new BasicInstrumentAudioProcessor();
 }
-
 
 
