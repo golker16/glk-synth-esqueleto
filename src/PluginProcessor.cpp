@@ -1,6 +1,9 @@
 #include "PluginProcessor.h"
 
 #include <cmath>
+#include <vector>
+#include <cstring>
+#include <memory>
 
 //==============================================================================
 // Synth Sound (dummy)
@@ -709,7 +712,7 @@ bool BasicInstrumentAudioProcessor::loadWtgenSlot (int slot, const juce::File& f
 
     {
         const juce::SpinLock::ScopedLockType sl (wtLock);
-        wtSlots[(size_t) slot] = wt;
+        wtSlots[(size_t) slot]    = wt;
         wtSlotJson[(size_t) slot] = jsonText;
         wtSlotName[(size_t) slot] = file.getFileName();
     }
@@ -799,7 +802,7 @@ void BasicInstrumentAudioProcessor::setStateInformation (const void* data, int s
             if (buildWavetableFromWtgenJson (json, nameHint, wt, err))
             {
                 const juce::SpinLock::ScopedLockType sl (wtLock);
-                wtSlots[(size_t) i] = wt;
+                wtSlots[(size_t) i]    = wt;
                 wtSlotJson[(size_t) i] = json;
                 wtSlotName[(size_t) i] = nameHint;
             }
@@ -815,11 +818,11 @@ namespace ui
     {
         BasicLNF()
         {
-            setColour (juce::Slider::rotarySliderFillColourId,   juce::Colours::white.withAlpha (0.85f));
-            setColour (juce::Slider::rotarySliderOutlineColourId,juce::Colours::white.withAlpha (0.20f));
-            setColour (juce::Slider::thumbColourId,              juce::Colours::white.withAlpha (0.90f));
-            setColour (juce::Label::textColourId,                juce::Colours::white.withAlpha (0.90f));
-            setColour (juce::Label::outlineColourId,             juce::Colours::transparentBlack);
+            setColour (juce::Slider::rotarySliderFillColourId,    juce::Colours::white.withAlpha (0.85f));
+            setColour (juce::Slider::rotarySliderOutlineColourId, juce::Colours::white.withAlpha (0.20f));
+            setColour (juce::Slider::thumbColourId,               juce::Colours::white.withAlpha (0.90f));
+            setColour (juce::Label::textColourId,                 juce::Colours::white.withAlpha (0.90f));
+            setColour (juce::Label::outlineColourId,              juce::Colours::transparentBlack);
 
             typeface = juce::Typeface::createSystemTypefaceFor (BinaryData::mi_fuente_ttf,
                                                                BinaryData::mi_fuente_ttfSize);
@@ -840,7 +843,7 @@ namespace ui
             if (typeface != nullptr)
                 return typeface;
 
-            return juce::LookAndFeel_V4::getTypefaceForFont (juce::Font());
+            return juce::LookAndFeel_V4::getTypefaceForFont (juce::Font (juce::FontOptions (12.0f)));
         }
 
         void drawRotarySlider (juce::Graphics& g, int x, int y, int w, int h,
@@ -1062,8 +1065,8 @@ private:
             juce::File(),
             "*.wtgen.json;*.json");
 
-        const int flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
-        fileChooser->launchAsync (flags, [this, slot] (const juce::FileChooser& fc)
+        const int chooserFlags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+        fileChooser->launchAsync (chooserFlags, [this, slot] (const juce::FileChooser& fc)
         {
             const auto file = fc.getResult();
             if (! file.existsAsFile())
