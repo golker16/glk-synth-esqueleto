@@ -1,5 +1,6 @@
 #pragma once
 #include <JuceHeader.h>
+#include <array>
 
 class BasicInstrumentAudioProcessor : public juce::AudioProcessor
 {
@@ -32,11 +33,43 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+    //=========================
+    // APVTS
+    //=========================
     juce::AudioProcessorValueTreeState apvts;
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    //=========================
+    // Wavetable slots API (4 wavetables)
+    //=========================
+    struct Wavetable : public juce::ReferenceCountedObject
+    {
+        using Ptr = juce::ReferenceCountedObjectPtr<Wavetable>;
+
+        int tableSize = 0;
+        int frames = 0;
+
+        // layout: [frames][tableSize]
+        juce::AudioBuffer<float> table;
+
+        juce::String name;
+    };
+
+    // Carga un archivo .wtgen.json en el slot [0..3]
+    // Devuelve true si ok; si falla, err contiene el motivo.
+    bool loadWtgenSlot (int slot, const juce::File& file, juce::String& err);
+
+    // Obtiene el wavetable del slot [0..3] (o nullptr si vacío)
+    Wavetable::Ptr getWtSlot (int slot) const;
+
 private:
     juce::Synthesiser synth;
+
+    //=========================
+    // Storage + lock
+    //=========================
+    juce::SpinLock wtLock;
+    std::array<Wavetable::Ptr, 4> wtSlots { nullptr, nullptr, nullptr, nullptr };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (BasicInstrumentAudioProcessor)
 };
